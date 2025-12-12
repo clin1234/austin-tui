@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
 
     name: Tests with Python ${{ matrix.python-version }} on Linux
     steps:
@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
 
     name: Tests with Python ${{ matrix.python-version }} on MacOS
     steps:
@@ -75,7 +75,7 @@ jobs:
         with:
           path: main
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}-dev
 
@@ -108,7 +108,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.13t", "3.14t"]
 
     name: Tests with Python ${{ matrix.python-version }} on Windows
     steps:
@@ -116,7 +116,7 @@ jobs:
         with:
           path: main
 
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}-dev
 
