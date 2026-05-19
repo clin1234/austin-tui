@@ -21,13 +21,23 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
+import sys
 from enum import Enum
 from pathlib import Path
+from textwrap import wrap
 from time import time
 from typing import Any
+from typing import Callable
+from typing import Optional
+from typing import Sequence
 
+from austin.aio import AsyncAustin
+from austin.cli import AustinArgumentParser
+from austin.cli import AustinCommandLineError
 from austin.events import AustinMetadata
+from austin.events import AustinSample
 from austin.format.mojo import MojoStreamWriter
+from psutil import Process
 
 from austin_tui import AustinProfileMode
 from austin_tui.adapters import Adapter
@@ -44,6 +54,7 @@ from austin_tui.adapters import ThreadNameAdapter
 from austin_tui.adapters import ThreadTopDataAdapter
 from austin_tui.model import Model
 from austin_tui.view import ViewBuilder
+from austin_tui.view.austin import AustinView
 from austin_tui.view.austin import AustinViewMode
 from austin_tui.widgets.markup import escape
 
@@ -53,6 +64,28 @@ class ThreadNav(Enum):
 
     PREV = -1
     NEXT = 1
+
+
+def _print(text: str) -> None:
+    for line in wrap(text, 78):
+        print(line, file=sys.stderr)
+
+
+class AustinTUIArgumentParser(AustinArgumentParser):
+    """Austin TUI implementation of the Austin argument parser."""
+
+    def __init__(self) -> None:
+        super().__init__(name="austin-tui", full=False)
+
+    def parse_args(self) -> Any:
+        """Parse command line arguments and report any errors."""
+        try:
+            return super().parse_args()
+        except AustinCommandLineError as e:
+            reason, *code = e.args
+            if reason:
+                _print(reason)
+            exit(code[0] if code else -1)
 
 
 class AustinTUIController:
@@ -77,14 +110,20 @@ class AustinTUIController:
 
     def __init__(self) -> None:
         self._view_mode = AustinViewMode.LIVE
-        self._scaler = None
-        self._formatter = None
+        self._scaler: Optional[Callable[..., Any]] = None
+        self._formatter: Optional[Callable[..., Any]] = None
         self._last_timestamp = 0
-        self._update_task = None
+        self._update_task: Optional[asyncio.Task[None]] = None
+        self._exception: Optional[Exception] = None
 
-        view_builder = ViewBuilder.from_resource("austin_tui.view", "tui.austinui")
+        view_builder = ViewBuilder.from_resource(
+            "austin_tui.view", "tui.austinui"
+        )
 
-        self.view = view = view_builder.build()  # type: ignore[assignment]
+        self.austin: Optional[AsyncAustin] = None
+        self.view: AustinView = view_builder.build()  # type: ignore[assignment]
+        view = self.view
+        self.view.callback = self.on_view_event
 
         view_builder.autoconnect(self)
 
@@ -142,8 +181,29 @@ class AustinTUIController:
             )
         )
 
-    def start(self) -> None:
+    async def start(self, args: Sequence[str]) -> None:
         """Start event."""
+        pargs = AustinTUIArgumentParser().parse_args()  # type: ignore[call-arg]
+
+        self.austin = AsyncAustin(self.on_sample, self.on_metadata, self.on_terminate)
+
+        await self.austin.start(args)
+
+        if pargs.pid is not None:
+            child_process = Process(pargs.pid)
+        else:
+            austin_process = Process(self.austin._proc.pid)
+            (child_process,) = austin_process.children()
+        command = child_process.cmdline()
+
+        mode = AustinProfileMode.MEMORY if pargs.memory else AustinProfileMode.TIME
+        self.view.mode = mode
+
+        """Austin ready callback."""
+        self.model.system.set_child_process(child_process)
+        # self.model.austin.set_metadata(self._meta)
+        self.model.austin.set_command_line(command)
+
         self._add_flamegraph_palette()
         self.view.open()
         self._update_task = asyncio.create_task(self.update_loop())
@@ -157,13 +217,44 @@ class AustinTUIController:
 
         self.command_line()
 
+        self.view.set_pid(child_process.pid, pargs.children)
+
+        try:
+            await self.austin.wait()
+        except Exception:
+            self.shutdown()
+            raise
+
+        try:
+            if self.view._input_task is not None:
+                await self.view._input_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            self.shutdown()
+            raise
+
+        if self._exception is not None:
+            raise self._exception
+
     async def stop(self) -> None:
-        """Stop event."""
+        """Called when Austin exits: cancel the update task and mark the view stopped.
+
+        Does not close the view — the user can still review final stats and press Q.
+        """
         self.model.system.stop()
+
         if self._update_task is not None:
             self._update_task.cancel()
-            await self._update_task
+            try:
+                await self._update_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._exception = exc
             self._update_task = None
+
+        self.view.stop()
 
     def update(self) -> bool:
         """Update event."""
@@ -185,23 +276,34 @@ class AustinTUIController:
 
     async def update_loop(self) -> None:
         """The UI update loop."""
-        while not self.view._stopped and self.view.is_open and self.view.root_widget:
-            if self.update():
-                if self._view_mode is AustinViewMode.GRAPH:
-                    self.view.flamegraph.draw()
-                else:
-                    self.view.table.draw()
+        try:
+            while (
+                not self.view._stopped
+                and self.view.is_open
+                and self.view.root_widget
+            ):
+                if self.update():
+                    if self._view_mode is AustinViewMode.GRAPH:
+                        self.view.flamegraph.draw()
+                    else:
+                        self.view.table.draw()
 
-            self.view.root_widget.refresh()
+                self.view.root_widget.refresh()
 
-            try:
-                await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                break
+                try:
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    break
+        except Exception as exc:
+            self.view.on_exception(exc)
 
     def _change_thread(self, direction: ThreadNav) -> bool:
         """Change thread."""
-        austin = self.model.frozen_austin if self.model.frozen else self.model.austin
+        austin = (
+            self.model.frozen_austin or self.model.austin
+            if self.model.frozen
+            else self.model.austin
+        )
         prev_index = austin.current_thread
 
         austin.current_thread = max(
@@ -220,7 +322,7 @@ class AustinTUIController:
     async def on_next_thread(self) -> bool:
         """Handle next thread event."""
         if self._change_thread(ThreadNav.NEXT):
-            if self._graph:
+            if self._view_mode is AustinViewMode.GRAPH:
                 self.view.flamegraph.draw()
                 self.view.flame_view.refresh()
             else:
@@ -232,7 +334,7 @@ class AustinTUIController:
     async def on_previous_thread(self) -> bool:
         """Handle previous thread event."""
         if self._change_thread(ThreadNav.PREV):
-            if self._graph:
+            if self._view_mode is AustinViewMode.GRAPH:
                 self.view.flamegraph.draw()
                 self.view.flame_view.refresh()
             else:
@@ -285,11 +387,16 @@ class AustinTUIController:
 
     async def on_save(self, _: Any = None) -> bool:
         """Save the collected stats."""
-        model = self.model.frozen_austin if self.model.frozen else self.model.austin
+        model = (
+            self.model.frozen_austin if self.model.frozen else self.model.austin
+        )
 
         def _dump_stats() -> None:
+            assert self.model.system.child_process is not None
             pid = self.model.system.child_process.pid
-            output_file = Path(f"austin_{int(time())}_{pid}").with_suffix(".mojo")
+            output_file = Path(f"austin_{int(time())}_{pid}").with_suffix(
+                ".mojo"
+            )
             try:
                 with output_file.open("wb") as stream:
                     mojo_writer = MojoStreamWriter(stream)
@@ -318,7 +425,9 @@ class AustinTUIController:
 
         self.model.toggle_freeze()
         self.update()
-        self.view.notification.set_text("Paused" if self.model.frozen else "Resumed")
+        self.view.notification.set_text(
+            "Paused" if self.model.frozen else "Resumed"
+        )
         return True
 
     def _change_threshold(self, delta: float) -> float:
@@ -360,3 +469,56 @@ class AustinTUIController:
         self.flamegraph()  # type: ignore[call-arg]
 
         return True
+
+    def shutdown(self) -> None:
+        """Force quit: terminate Austin and close the view immediately."""
+        try:
+            if self.austin is not None:
+                self.austin.terminate()
+        except Exception:
+            pass
+        try:
+            self.view.close()
+        except Exception:
+            pass
+
+    def on_shutdown(self, _: Any = None) -> None:
+        """The shutdown view event handler."""
+        self.shutdown()
+
+    def on_exception(self, exc: Exception) -> None:
+        """The exception view event handler."""
+        self.shutdown()
+        raise exc
+
+    # Austin events
+
+    async def on_sample(self, sample: AustinSample) -> None:
+        """Austin sample received callback."""
+        self.model.austin.update(sample)
+
+    async def on_metadata(self, metadata: AustinMetadata) -> None:
+        """Austin metadata received callback."""
+        if metadata.name == "mode":
+            self.view.set_mode(metadata.value)
+        elif metadata.name == "python":
+            self.view.set_python(metadata.value)
+        # else:
+        #     self.model.austin.set_metadata(self._meta)
+
+    async def on_terminate(self) -> None:
+        """Austin terminate callback."""
+        await self.stop()
+
+    # View events
+
+    def on_view_event(self, event: AustinView.Event, data: Any = None) -> None:
+        """View events handler."""
+
+        def _unhandled(_: Any) -> None:
+            raise RuntimeError(f"Unhandled view event: {event}")
+
+        {
+            AustinView.Event.QUIT: self.on_shutdown,
+            AustinView.Event.EXCEPTION: self.on_exception,
+        }.get(event, _unhandled)(data)  # type: ignore[operator]
