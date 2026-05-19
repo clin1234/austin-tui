@@ -27,8 +27,8 @@ from typing import Optional
 from typing import Set
 from typing import Union
 
-from austin.events import ThreadName
 from austin.stats import HierarchicalStats
+from austin.stats import ThreadInfo
 
 from austin_tui import AustinProfileMode
 from austin_tui.model import Model
@@ -282,7 +282,7 @@ class ThreadDataAdapter(BaseThreadDataAdapter):
         pid, _, thread_name = thread_key.partition(":")
         iid, _, thread = thread_name.partition(":")
         thread_stats = austin.stats.processes[int(pid)].threads[
-            ThreadName(thread, int(iid))
+            ThreadInfo(thread, int(iid))
         ]
         frames = austin.get_last_stack(thread_key).frames
 
@@ -386,7 +386,7 @@ class ThreadTopDataAdapter(BaseThreadDataAdapter):
         pid, _, thread_name = thread_key.partition(":")
         iid, _, thread = thread_name.partition(":")
         thread_stats = austin.stats.processes[int(pid)].threads[
-            ThreadName(thread, int(iid))
+            ThreadInfo(thread, int(iid))
         ]
         if children := list(thread_stats.children.values()):
             for stats in children[:-1]:
@@ -541,7 +541,7 @@ class ThreadFullDataAdapter(BaseThreadDataAdapter):
         pid, _, thread_name = thread_key.partition(":")
         iid, _, thread = thread_name.partition(":")
         thread_stats = austin.stats.processes[int(pid)].threads[
-            ThreadName(thread, int(iid))
+            ThreadInfo(thread, int(iid))
         ]
         if children := list(thread_stats.children.values()):
             for stats in children[:-1]:
@@ -578,7 +578,7 @@ class FlameGraphAdapter(Adapter):
         pid, _, thread_name = thread_key.partition(":")
         iid, _, thread = thread_name.partition(":")
         thread = austin.stats.processes[int(pid)].threads[
-            ThreadName(thread, int(iid))
+            ThreadInfo(thread, int(iid))
         ]
 
         cs = {}  # type: ignore[var-annotated]
